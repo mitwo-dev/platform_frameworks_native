@@ -48,6 +48,7 @@
 #include "RotationVectorSensor.h"
 #include "SensorFusion.h"
 #include "SensorService.h"
+#include "TemperatureSensor.h"
 
 namespace android {
 // ---------------------------------------------------------------------------
@@ -84,6 +85,8 @@ void SensorService::onFirstRef()
                     (1<<SENSOR_TYPE_GRAVITY) |
                     (1<<SENSOR_TYPE_LINEAR_ACCELERATION) |
                     (1<<SENSOR_TYPE_ROTATION_VECTOR);
+            size_t temperatureCount = 0;
+            sensor_t temperatureSensor;
 
             mLastEventSeen.setCapacity(count);
             for (ssize_t i=0 ; i<count ; i++) {
@@ -101,7 +104,21 @@ void SensorService::onFirstRef()
                     case SENSOR_TYPE_ROTATION_VECTOR:
                         virtualSensorsNeeds &= ~(1<<list[i].type);
                         break;
+                    case SENSOR_TYPE_TEMPERATURE:
+                    case SENSOR_TYPE_AMBIENT_TEMPERATURE:
+                        temperatureSensor = list[i];
+                        temperatureCount++;
+                        break;
                 }
+            }
+
+            // hardware just support one temperature sensor
+            if (temperatureCount == 1) {
+                // add virtual temperature sensor to support alternate type
+                // since temperature sensor has two type id now:
+                // 1.SENSOR_TYPE_TEMPERATURE          7
+                // 2.SENSOR_TYPE_AMBIENT_TEMPERATURE  13
+                registerVirtualSensor( new TemperatureSensor(temperatureSensor) );
             }
 
             // it's safe to instantiate the SensorFusion object here

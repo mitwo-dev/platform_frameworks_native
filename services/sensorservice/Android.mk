@@ -12,7 +12,9 @@ LOCAL_SRC_FILES:= \
     SensorDevice.cpp \
     SensorFusion.cpp \
     SensorInterface.cpp \
-    SensorService.cpp
+    SensorService.cpp \
+    TemperatureSensor.cpp \
+
 
 LOCAL_CFLAGS:= -DLOG_TAG=\"SensorService\"
 
