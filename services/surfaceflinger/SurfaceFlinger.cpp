@@ -128,6 +128,10 @@ const String16 sReadFramebuffer("android.permission.READ_FRAME_BUFFER");
 const String16 sDump("android.permission.DUMP");
 
 // ---------------------------------------------------------------------------
+// Initialize extendedMode to false
+#ifdef QCOM_BSP
+bool SurfaceFlinger::sExtendedMode = false;
+#endif
 
 SurfaceFlinger::SurfaceFlinger()
     :   BnSurfaceComposer(),
@@ -605,7 +609,7 @@ void SurfaceFlinger::init() {
             vsyncPhaseOffsetNs, true);
     mEventThread = new EventThread(vsyncSrc);
     sp<VSyncSource> sfVsyncSrc = new DispSyncSource(&mPrimaryDispSync,
-            sfVsyncPhaseOffsetNs, false);
+            sfVsyncPhaseOffsetNs, true);
     mSFEventThread = new EventThread(sfVsyncSrc);
     mEventQueue.setEventThread(mSFEventThread);
 
@@ -634,6 +638,7 @@ int32_t SurfaceFlinger::allocateHwcDisplayId(DisplayDevice::DisplayType type) {
 
 void SurfaceFlinger::startBootAnim() {
     // start boot animation
+    mBootFinished = false;
     property_set("service.bootanim.exit", "0");
     property_set("ctl.start", "bootanim");
 }
@@ -851,6 +856,13 @@ void SurfaceFlinger::onHotplugReceived(int type, bool connected) {
         } else {
             mCurrentState.displays.removeItem(mBuiltinDisplays[type]);
             mBuiltinDisplays[type].clear();
+#ifdef QCOM_BSP
+            // if extended_mode is set, and set mVisibleRegionsDirty
+            // as we need to rebuildLayerStack
+            if(isExtendedMode()) {
+                mVisibleRegionsDirty = true;
+            }
+#endif
         }
         setTransactionFlags(eDisplayTransactionNeeded);
 
@@ -999,6 +1011,11 @@ void SurfaceFlinger::postComposition()
 }
 
 void SurfaceFlinger::rebuildLayerStacks() {
+#ifdef QCOM_BSP
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("sys.extended_mode", prop, "0");
+    sExtendedMode = atoi(prop) ? true : false;
+#endif
     // rebuild the visible layer list per screen
     if (CC_UNLIKELY(mVisibleRegionsDirty)) {
         ATRACE_CALL();
@@ -1352,8 +1369,14 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                                 || (state.viewport != draw[i].viewport)
                                 || (state.frame != draw[i].frame))
                         {
-                            disp->setProjection(state.orientation,
-                                    state.viewport, state.frame);
+                            // Honor the orientation change after boot
+                            // animation completes or the new orientation is
+                            // same as panel orientation..
+                            if(mBootFinished ||
+                               state.orientation == disp->getOrientation()) {
+                                disp->setProjection(state.orientation,
+                                        state.viewport, state.frame);
+                            }
                         }
                     }
                 }
@@ -1567,17 +1590,26 @@ void SurfaceFlinger::computeVisibleRegions(size_t dpy,
 
     outDirtyRegion.clear();
     bool bIgnoreLayers = false;
-    int extOnlyLayerIndex = -1;
+    int indexLOI = -1;
     size_t i = currentLayers.size();
 #ifdef QCOM_BSP
     while (i--) {
         const sp<Layer>& layer = currentLayers[i];
         // iterate through the layer list to find ext_only layers and store
         // the index
-        if ((dpy && layer->isExtOnly())) {
+        if (layer->isSecureDisplay()) {
             bIgnoreLayers = true;
-            extOnlyLayerIndex = i;
+            indexLOI = -1;
+            if(!dpy)
+                indexLOI = i;
             break;
+        }
+        // iterate through the layer list to find ext_only layers or yuv
+        // layer(extended_mode) and store the index
+        if ((dpy && (layer->isExtOnly() ||
+                     (isExtendedMode() && layer->isYuvLayer())))) {
+            bIgnoreLayers= true;
+            indexLOI = i;
         }
     }
     i = currentLayers.size();
@@ -1589,12 +1621,17 @@ void SurfaceFlinger::computeVisibleRegions(size_t dpy,
         const Layer::State& s(layer->getDrawingState());
 
 #ifdef QCOM_BSP
-        // Only add the layer marked as "external_only" to external list and
-        // only remove the layer marked as "external_only" from primary list
+        // Only add the layer marked as "external_only" or yuvLayer
+        // (extended_mode) to external list and
+        // only remove the layer marked as "external_only" or yuvLayer in
+        // extended_mode from primary list
         // and do not add the layer marked as "internal_only" to external list
-        if((bIgnoreLayers && extOnlyLayerIndex != (int)i) ||
+        // Add secure UI layers to primary and remove other layers from internal
+        //and external list
+        if(((bIgnoreLayers && indexLOI != (int)i) ||
            (!dpy && layer->isExtOnly()) ||
-           (dpy && layer->isIntOnly())) {
+                     (!dpy && isExtendedMode() && layer->isYuvLayer()))||
+                     (dpy && layer->isIntOnly())) {
             // Ignore all other layers except the layers marked as ext_only
             // by setting visible non transparent region empty.
             Region visibleNonTransRegion;
@@ -1903,6 +1940,9 @@ void SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
                         layer->draw(hw, clip);
                         break;
                     }
+                    case HWC_BLIT:
+                        //Do nothing
+                        break;
                     case HWC_FRAMEBUFFER_TARGET: {
                         // this should not happen as the iterator shouldn't
                         // let us get there.
@@ -3057,7 +3097,23 @@ void SurfaceFlinger::renderScreenImplLocked(
         const Layer::State& state(layer->getDrawingState());
         if (state.layerStack == hw->getLayerStack()) {
             if (state.z >= minLayerZ && state.z <= maxLayerZ) {
+#ifdef QCOM_BSP
+                // dont render the secure Display Layer
+                if(layer->isSecureDisplay()) {
+                    continue;
+                }
+#endif
+#ifdef QCOM_BSP
+                int dispType = hw->getDisplayType();
+                // Dont let ext_only and extended_mode to be captured
+                // If not, we would see incorrect image during rotatoin
+                // on primary
+                if (layer->isVisible() &&
+                    not (!dispType && (layer->isExtOnly() ||
+                         (isExtendedMode() && layer->isYuvLayer())))) {
+#else
                 if (layer->isVisible()) {
+#endif
                     if (filtering) layer->setFiltering(true);
                     layer->draw(hw);
                     if (filtering) layer->setFiltering(false);

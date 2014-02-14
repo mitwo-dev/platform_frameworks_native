@@ -36,8 +36,11 @@
 
 #ifdef QCOM_BSP
 #include <gralloc_priv.h>
+#include <qdMetaData.h>
+#ifdef VFM_AVAILABLE
+#include "vfm_metadata.h"
+#endif //VFM_AVAILABLE
 #endif
-
 namespace android {
 
 Surface::Surface(
@@ -213,6 +216,9 @@ int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
         if (result != NO_ERROR) {
             ALOGE("dequeueBuffer: IGraphicBufferProducer::requestBuffer failed: %d", result);
             return result;
+        } else if (gbuf == 0) {
+            ALOGE("dequeueBuffer: Buffer is null return");
+            return INVALID_OPERATION;
         }
     }
 
@@ -279,6 +285,27 @@ int Surface::queueBuffer(android_native_buffer_t* buffer, int fenceFd) {
     } else {
         timestamp = mTimestamp;
     }
+#ifdef QCOM_BSP
+#ifdef VFM_AVAILABLE
+    /* Add a session ID while queuing the buffers to maintain session
+       association */
+    {
+        int nErr;
+        private_handle_t* pBufPrvtHandle = (private_handle_t*)buffer->handle;
+
+        VfmMetaData_t vfmMetaData;
+        memset(&vfmMetaData, 0, sizeof(VfmMetaData_t));
+
+        vfmMetaData.type = VFM_SESSION_ID;
+        vfmMetaData.sessionId =
+            reinterpret_cast<int>(mGraphicBufferProducer.get());
+        nErr = setMetaData(pBufPrvtHandle, PP_PARAM_VFM_DATA,
+            (void*)&vfmMetaData);
+        if(0 != nErr)
+            ALOGE("Error:%d in setMetaData PP_PARAM_SESSIONID", nErr);
+   }
+#endif
+#endif
     int i = getSlotFromBufferLocked(buffer);
     if (i < 0) {
         return i;
@@ -351,6 +378,16 @@ int Surface::query(int what, int* value) const {
                     }
                 }
                 return err;
+            }
+            case NATIVE_WINDOW_CONSUMER_USAGE_BITS: {
+                status_t err = NO_ERROR;
+                err = mGraphicBufferProducer->query(what, value);
+                if(err == NO_ERROR) {
+                    *value |= mReqUsage;
+                    return NO_ERROR;
+                } else {
+                    return err;
+                }
             }
         }
     }
@@ -801,6 +838,7 @@ status_t Surface::lock(
         }
 
         // figure out if we can copy the frontbuffer back
+        int backBufferSlot(getSlotFromBufferLocked(backBuffer.get()));
         const sp<GraphicBuffer>& frontBuffer(mPostedBuffer);
         const bool canCopyBack = (frontBuffer != 0 &&
                 backBuffer->width  == frontBuffer->width &&
@@ -808,15 +846,19 @@ status_t Surface::lock(
                 backBuffer->format == frontBuffer->format);
 
         if (canCopyBack) {
-            // copy the area that is invalid and not repainted this round
-            const Region copyback(mDirtyRegion.subtract(newDirtyRegion));
+            Mutex::Autolock lock(mMutex);
+            Region oldDirtyRegion;
+            for(int i = 0 ; i < NUM_BUFFER_SLOTS; i++ ) {
+                if(i != backBufferSlot && !mSlots[i].dirtyRegion.isEmpty())
+                    oldDirtyRegion.orSelf(mSlots[i].dirtyRegion);
+            }
+            const Region copyback(oldDirtyRegion.subtract(newDirtyRegion));
             if (!copyback.isEmpty())
                 copyBlt(backBuffer, frontBuffer, copyback);
         } else {
             // if we can't copy-back anything, modify the user's dirty
             // region to make sure they redraw the whole buffer
             newDirtyRegion.set(bounds);
-            mDirtyRegion.clear();
             Mutex::Autolock lock(mMutex);
             for (size_t i=0 ; i<NUM_BUFFER_SLOTS ; i++) {
                 mSlots[i].dirtyRegion.clear();
@@ -826,15 +868,9 @@ status_t Surface::lock(
 
         { // scope for the lock
             Mutex::Autolock lock(mMutex);
-            int backBufferSlot(getSlotFromBufferLocked(backBuffer.get()));
-            if (backBufferSlot >= 0) {
-                Region& dirtyRegion(mSlots[backBufferSlot].dirtyRegion);
-                mDirtyRegion.subtract(dirtyRegion);
-                dirtyRegion = newDirtyRegion;
-            }
+            mSlots[backBufferSlot].dirtyRegion = newDirtyRegion;
         }
 
-        mDirtyRegion.orSelf(newDirtyRegion);
         if (inOutDirtyBounds) {
             *inOutDirtyBounds = newDirtyRegion.getBounds();
         }
